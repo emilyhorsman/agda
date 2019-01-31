@@ -1039,6 +1039,8 @@ primTransHComp cmd ts nelims = do
         s <- reduce $ getSort t
         case s of
           (Type l) -> return l
+          -- TODO MetaS | Prop | DefS | ...
+          -- Inf -> __IMPOSSIBLE__
           _        -> __IMPOSSIBLE__
       -- mkLam DoTransp = Lam defaultArgInfo
       -- mkLam DoHComp = id
