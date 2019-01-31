@@ -52,6 +52,7 @@ import Agda.TypeChecking.Coverage.SplitTree
 import Agda.TypeChecking.Conversion (tryConversion, equalType, equalTermOnFace)
 import Agda.TypeChecking.Datatypes (getConForm)
 import {-# SOURCE #-} Agda.TypeChecking.Empty (isEmptyTel)
+import Agda.TypeChecking.Free
 import Agda.TypeChecking.Irrelevance
 import Agda.TypeChecking.Patterns.Internal (dotPatternsToPatterns)
 import Agda.TypeChecking.Pretty
@@ -510,6 +511,109 @@ cover f cs sc@(SClause tel ps _ _ target) = updateRelevance $ do
     etaRecordSplits n ps (q , sc) t =
       (q , addEtaSplits 0 (gatherEtaSplits n sc ps) t)
 
+trFillTel :: Abs Telescope -- Γ ⊢ i.Δ
+          -> Term
+          -> Args          -- Γ ⊢ δ : Δ[0]
+          -> Term          -- Γ ⊢ r : I
+          -> TCM Args      -- Γ ⊢ Δ[r]
+trFillTel delta phi args r = do
+  imin <- primIMin
+  imax <- primIMax
+  ineg <- primINeg
+  transpTel (Abs "j" $ raise 1 delta `lazyAbsApp` (imin `apply` (map argN [var 0, raise 1 r])))
+            (imax `apply` [argN $ ineg `apply` [argN r], argN phi])
+            args
+
+transpTel :: Abs Telescope -- Γ ⊢ i.Δ
+          -> Term          -- Γ ⊢ φ : F  -- i.Δ const on φ
+          -> Args          -- Γ ⊢ δ : Δ[0]
+          -> TCM Args      -- Γ ⊢ Δ[1]
+transpTel delta phi args = do
+  tTransp <- primTrans
+  imin <- primIMin
+  imax <- primIMax
+  ineg <- primINeg
+  let
+    bapp :: Subst t a => NamesT TCM (Abs a) -> NamesT TCM t -> NamesT TCM a
+    bapp t u = lazyAbsApp <$> t <*> u
+    gTransp (Just l) t phi a = pure tTransp <#> l <@> (Lam defaultArgInfo . fmap unEl <$> t) <@> phi <@> a
+    gTransp Nothing  t phi a = do
+      -- Γ ⊢ i.Ξ
+      xi <- (open =<<) $ do
+        bind "i" $ \ i -> do
+          TelV xi _ <- (lift . telView =<<) $ t `bapp` i
+          return xi
+      argnames <- do
+        teleArgNames . unAbs <$> xi
+      glamN argnames $ \ xi_args -> do
+        b' <- bind "i" $ \ i -> do
+          ti <- t `bapp` i
+          xin <- bind "i" $ \ i -> xi `bapp` (pure ineg <@> i)
+          xi_args <- xi_args
+          ni <- pure ineg <@> i
+          phi <- phi
+          lift $ piApplyM ti =<< trFillTel xin phi xi_args ni
+        axi <- do
+          a <- a
+          xif <- bind "i" $ \ i -> xi `bapp` (pure ineg <@> i)
+          phi <- phi
+          xi_args <- xi_args
+          lift $ apply a <$> transpTel xif phi xi_args
+        s <- reduce $ getSort (absBody b')
+        case s of
+          Type l -> do
+            l <- open $ lam_i (Level l)
+            b' <- open b'
+            axi <- open axi
+            gTransp (Just l) b' phi axi
+          Inf    ->
+            case 0 `freeIn` (raise 1 b' `lazyAbsApp` var 0) of
+              False -> return axi
+              True -> typeError $ GenericError "Cannot transport type b'" -- better error!
+          _ -> __IMPOSSIBLE__ -- TODO fixme
+
+        
+    {-
+    t <- raise 1 t `apply` var 0
+    TelV g b <- telView t
+    let b' = abstract (i,g) b `apply` (i , trFillTel (\ i → g (~ i)) (teleArgs g) (~ i))
+    s <- reduce $ getSort b'
+    case
+      s = Type l -> transp l b' phi (a $ transpTel (\ i → g (~ i)) (teleArgs g))
+      s = Inf -> case
+                   free 0 (b $ var 0) -> (a $ transpTel (\ i → g (~ i)) (teleArgs g))
+                   _                  -> error.
+    -}
+    lam_i = Lam defaultArgInfo . Abs "i"
+    go :: Telescope -> Term -> Args -> TCM Args
+    go EmptyTel            _   []       = return []
+    go (ExtendTel t delta) phi (a:args) = do
+      -- Γ,i ⊢ t
+      -- Γ,i ⊢ (x : t). delta
+      -- Γ ⊢ a : t[0]
+      s <- reduce $ getSort t
+      -- Γ ⊢ b : t[1], Γ,i ⊢ b : t[i]
+      (b,bf) <- runNamesT [] $ do
+        l <- case s of
+               Inf -> return Nothing
+               Type l -> Just <$> open (lam_i (Level l))
+               _ -> __IMPOSSIBLE__ -- not true
+        t <- open $ Abs "i" (unDom t)
+        [phi,a] <- mapM open [phi, unArg a]
+        b <- gTransp l t phi a
+        bf <- bind "i" $ \ i -> do
+                            gTransp ((<$> l) $ \ l -> lam "j" $ \ j -> l <@> (pure imin <@> i <@> j))
+                                    (bind "j" $ \ j -> t `bapp` (pure imin <@> i <@> j))
+                                    (pure imax <@> (pure ineg <@> i) <@> phi)
+                                    a
+        return (b, absBody bf)
+      (:) (b <$ a) <$> go (lazyAbsApp delta bf) phi args
+    go (ExtendTel t delta) phi []    = __IMPOSSIBLE__
+    go EmptyTel            _   (_:_) = __IMPOSSIBLE__
+  go (absBody delta) phi args
+
+
+
 -- | Append a instance clause to the clauses of a function.
 createMissingHCompClause
   :: QName
@@ -520,7 +624,7 @@ createMissingHCompClause
   -> SplitClause
        -- ^ Clause to add.
    -> TCM Clause
-createMissingHCompClause f n x old_sc (SClause tel ps sigma' cps (Just t)) = setCurrentRange f $ do
+createMissingHCompClause f n x old_sc (SClause tel ps _sigma' cps (Just t)) = setCurrentRange f $ do
   reportSDoc "tc.cover.hcomp" 20 $ addContext tel $ text "Trying to create right-hand side of type" <+> prettyTCM t
   reportSDoc "tc.cover.hcomp" 30 $ addContext tel $ text "ps = " <+> text (show (fromSplitPatterns ps))
   reportSDoc "tc.cover.hcomp" 30 $ text "tel = " <+> prettyTCM tel
@@ -535,6 +639,7 @@ createMissingHCompClause f n x old_sc (SClause tel ps sigma' cps (Just t)) = set
       -- Γ(x:H)Δ ⊢ old_t
       -- vs = iApplyVars old_ps
       -- [ α ⇒ b ] = [(i,f old_ps (i=0),f old_ps (i=1)) | i <- vs]
+      
       -- Γ(x:H)(δ : Δ) ⊢ [ α ⇒ b ] = [ α0 ⇒ b0 x δ, α1 ⇒ b1 ]
       -- Γ(x:H)Δ ⊢ f old_ps : old_t [ α ⇒ b ]
       -- Γ ⊢ d = λ x δ. f old_ps : (x : H) → {Δ → old_t}[ α1 ⇒ b1 ] -- actual Pi/Path type here.
@@ -564,48 +669,42 @@ createMissingHCompClause f n x old_sc (SClause tel ps sigma' cps (Just t)) = set
             typeError . GenericError . show =<<
                     (text "The result type is non-fibrant when generating hcomp clause:" <+> prettyTCM t)
                     -- Andrea TODO better error message.
-      (gamma,hdelta@(ExtendTel hdom _)) = splitTelescopeAt (size old_tel - (blockingVarNo x + 1)) old_tel
 
+      -- Γ ⊢ hdelta = (x : H)(δ : Δ)
+      (gamma,hdelta@(ExtendTel hdom delta)) = splitTelescopeAt (size old_tel - (blockingVarNo x + 1)) old_tel
 
+      -- Γ,φ,u,u0,(x:H)(δ : Δ) ⊢ rhoS : Γ(x:H)(δ : Δ)
+      rhoS = liftS (size hdelta) $ raiseS 3
       vs = iApplyVars (scPats old_sc)
-  alphab_1 <- forM (filter (< size hdelta) vs) $ \ i -> do
+
+  -- Γ(x:H)(δ : Δ) ⊢ [ α ⇒ b ] = [(i,f old_ps (i=0),f old_ps (i=1)) | i <- vs]
+  alphab <- forM vs $ \ i -> do
                let
+                 -- Γ(x:H)(δ : Δ) ⊢
                  tm = Def f old_ps
-                 (_,rest) = splitTelescopeAt (size hdelta - i) hdelta
-               -- Γ,(x:H).Δ0,(i:I).rest ⊢ tm
-               -- Γ,(x:H).Δ0.rest ⊢ subst i b tm
-               -- Γ,(x:H).Δ0 ⊢ abstract rest $ subst i b tm
                -- TODO only reduce IApply _ _ (0/1), as to avoid termination problems
-               (l,r) <- reduce (subst i iz tm, subst i io tm)
-               return $ (var i, (abstract rest l, abstract rest r))
+               (l,r) <- reduce (inplaceS i iz `applySubst` tm, inplaceS i io `applySubst` tm)
+               return $ (var i, (l, r))
 
-  -- Γ ⊢ [ α0 → b0 ] : (x : H) → {Δ → old_t}[ α1 → b1 ]
-  alphab_0 <- forM (filter (> size hdelta) vs) $ \ i -> do
-               let
-                 tm = Def f old_ps
-                 absd = abstract hdelta
-                 j = i - size hdelta
-               -- Γ,(x:H).Δ ⊢ tm
-               -- Γ ⊢ abstract hdelta tm
-               -- TODO only reduce IApply _ _ (0/1), it's to avoid termination problems anyway
-               -- though right now we are just not termination checking this clause.
-               (l,r) <- reduce $ ( inplaceS i iz `applySubst` tm
-                                 , inplaceS i io `applySubst` tm)
-               return (var j, (absd l, absd r))
 
-  -- Γ,(x:H),Δ ⊢ old_t,  Γ ⊢ [α1 → b1] : ..
-  -- Γ ⊢ (x : H) -> {Δ}[α1 → b1]
-  hdelta_type <- telePiPath id hdelta (unArg old_t) alphab_1
 
   cl <- do
     (ty,rhs) <- do
-      -- Γ,φ,u,u0 ⊢ comp (\ i. {Δ}[ α1 → b1 ](x = hfill φ u u0 i))
-      --                 (\ i.  [ φ  ↦ d (hfill φ u u0 i)     = d (u i)
-      --                          α0 ↦ b0 (hfill φ u u0 i)
+      -- Γ(x:H)Δ ⊢ g = f old_ps : old_t [ α ⇒ b ]
+      -- Γ(x:H)(δ : Δ) ⊢ [ α ⇒ b ]
+      -- Γ,φ,u,u0,(i : I) ⊢ Δf = Δ(x = hfill φ u u0 i)
+      -- Γ,φ,u,u0,δ : Δ(x = hcomp φ u u0), i : I ⊢ δ_fill = tFillTel (i. Δf) δ i : Δ[γ, x = hfill φ u u0 i]
+      -- Γ,φ,u,u0,δ : Δ(x = hcomp φ u u0), i : I ⊢ old_t_fill = old_t[γ,x = hfill φ u u0 i, δ_fill[-,i]]
+
+      -- Γ,φ,u,u0,(i : I).Δ(x = hfill φ u u0 i) ⊢ old_t_fill = old_t[γ,x = hfill φ u u0 i,δ]
+      -- Γ,φ,u,u0 ⊢ compTel (i. Δ(x = hfill φ u u0 i))
+      --                    (i.δ. old_t_fill[-,i,δ]_level) (i.δ. old_t_fill[-,i,δ])
+      --                 (i.δ.  [ φ ↦ g[γ,x = hfill φ u u0 i,δ] = g[γ,u i,δ]
+      --                          α ↦ b[γ,x = hfill φ u u0 i,δ]
       --                        ])
-      --                 (d u0)
+      --                 (δ0. g[γ,x = u0,δ0]) : (Δ → old_t)(x = hcomp φ u u0)
+
       runNamesT [] $ do
-          cxt <- currentCxt
           tPOr <- fromMaybe __IMPOSSIBLE__ <$> getTerm' "primPOr"
           tIMax <- fromMaybe __IMPOSSIBLE__ <$> getTerm' builtinIMax
           tIMin <- fromMaybe __IMPOSSIBLE__ <$> getTerm' builtinIMin
@@ -629,69 +728,103 @@ createMissingHCompClause f n x old_sc (SClause tel ps sigma' cps (Just t)) = set
                                 forward la bA i (u <@> i <..> o))
                         <@> forward la bA (pure iz) u0
           let
-            hfill la bA phi u u0 i = pure tHComp <#> la <#> bA
-                                               <#> (pure tIMax <@> phi <@> (pure tINeg <@> i))
-                                               <@> (lam "j" $ \ j -> pure tPOr <#> la <@> phi <@> (pure tINeg <@> i) <#> (ilam "o" $ \ _ -> bA)
+            hcomp la bA phi u u0 = pure tHComp <#> la <#> bA
+                                               <#> phi
+                                               <@> u
+                                               <@> u0
+
+            hfill la bA phi u u0 i = hcomp la bA
+                                               (pure tIMax <@> phi <@> (pure tINeg <@> i))
+                                               (lam "j" $ \ j -> pure tPOr <#> la <@> phi <@> (pure tINeg <@> i) <#> (ilam "o" $ \ _ -> bA)
                                                      <@> (ilam "o" $ \ o -> u <@> (pure tIMin <@> i <@> j) <..> o)
                                                      <@> (ilam "o" $ \ _ -> u0)
                                                    )
-                                               <@> u0
-          (hdom,alphab_0) <- pure $ raise 3 (hdom,alphab_0)
-          [hdelta_type] <- mapM (open . raise 3) [hdelta_type]
-          -- Γ,φ,u,u0 ⊢
-          [phi,u,u0] <- mapM (open . var) [2,1,0]
+                                               u0
+          -- Γ,φ,u,u0,(δ : Δ(x = hcomp φ u u0)) ⊢ hcompS : Γ(x:H)(δ : Δ)
+          hcompS <- lift $ do
+            hdom <- pure $ raise 3 hdom
+            let
+              [phi,u,u0] = map (pure . var) [2,1,0]
+              htype = pure $ unEl . unDom $ hdom
+              lvl = getLevel $ unDom hdom
+            hc <- pure tHComp <#> lvl <#> htype
+                                      <#> phi
+                                      <@> u
+                                      <@> u0
+            return $ liftS (size delta) $ hc `consS` raiseS 3
+          -- Γ,φ,u,u0,Δ(x = hcomp phi u u0) ⊢ raise 3+|Δ| hdom
+          hdom <- pure $ raise (3+size delta) hdom
           htype <- open $ unEl . unDom $ hdom
           lvl <- open =<< (lift . getLevel $ unDom hdom)
+
+          -- Γ,φ,u,u0,Δ(x = hcomp phi u u0) ⊢
+          [phi,u,u0] <- mapM (open . raise (size delta) . var) [2,1,0]
           -- Γ,x,Δ ⊢ f old_ps
           -- Γ ⊢ abstract hdelta (f old_ps)
-          d <- open $ raise 3 $ abstract hdelta (Def f old_ps)
-          let call v = d <@> v
+          g <- open $ raise (3+size delta) $ abstract hdelta (Def f old_ps)
+          old_t <- open $ raise (3+size delta) $ abstract hdelta (unArg old_t)
+
+          (delta_fill :: NamesT TCM Term -> NamesT TCM Args) <- do
+            -- Γ,φ,u,u0,Δ(x = hcomp phi u u0) ⊢ x.Δ
+            delta <- open $ raise (3+size delta) delta
+            -- Γ,φ,u,u0,Δ(x = hcomp phi u u0) ⊢ i.Δ(x = hfill phi u u0 (~ i))
+            deltaf <- open =<< bind "i" (\ i ->
+                           (lazyAbsApp <$> delta <*> hfill lvl htype phi u u0 (ineg i)))
+            -- Γ,φ,u,u0,Δ(x = hcomp phi u u0) ⊢ Δ(x = hcomp phi u u0) = Δf[0]
+            args <- (open =<<) $ teleArgs <$> (lazyAbsApp <$> deltaf <*> pure iz)
+            return $ \ i -> do
+              -- Γ,φ,u,u0,Δ(x = hcomp phi u u0),i:I ⊢ ... : Δ(x = hfill phi u u0 i)
+              join . fmap lift $ trFillTel <$> deltaf <*> pure iz <*> args <*> (ineg i)
+
+          let
+            apply_delta_fill i f = apply <$> f <*> delta_fill i
+            call v i = apply_delta_fill i $ g <@> v
           ty <- do
                 return $ \ i -> do
                     v <- hfill lvl htype phi u u0 i
-                    hd <- hdelta_type
-                    lift $ piApplyM hd [Arg (domInfo hdom) v]
+                    hd <- old_t
+                    args <- delta_fill i
+                    lift $ piApplyM hd $ [Arg (domInfo hdom) v] ++ args
           let
             pOr la i j u0 u1 = pure tPOr <#> (lift . getLevel =<< la)        <@> i <@> j
                                          <#> (ilam "o" $ \ _ -> unEl <$> la) <@> u0 <@> u1
-          -- Γ,φ,u,u0 ⊢ α0 : 𝔽
-          alpha0 <- do
-             vars <- mapM (open . fst) alphab_0
-             return $ foldr imax (pure iz) $ map (\ v -> v `imax` ineg v) vars
+          alpha <- do
+            vars <- mapM (open . applySubst hcompS . fst) alphab
+            return $ foldr imax (pure iz) $ map (\ v -> v `imax` ineg v) vars
 
-          -- Γ,φ,u,u0 ⊢ b0 : (i : I) → [α0] -> {Δ → old_t}[ α1 → b1 ](x = hfill φ u u0 i)
-          b0 <- do
-             sides <- forM alphab_0 $ \ (psi,(t,u)) -> do
-                [psi,t,u] <- mapM open [psi,t,u]
-                return $ (ineg psi `imax` psi, \ i -> pOr (ty i) (ineg psi) psi (ilam "o" $ \ _ -> t <@> hfill lvl htype phi u u0 i)
-                                                            (ilam "o" $ \ _ -> u <@> hfill lvl htype phi u u0 i))
+          -- Γ,φ,u,u0,Δ(x = hcomp φ u u0) ⊢ b : (i : I) → [α] -> old_t[γ,x = hfill φ u u0 i,δ_fill[-,i]]
+          b <- do
+             sides <- forM alphab $ \ (psi,(t,u)) -> do
+                psi <- open $ hcompS `applySubst` psi
+
+                [t,u] <- mapM (open . raise (3+size delta) . abstract hdelta) [t,u]
+                return $ (ineg psi `imax` psi, \ i -> pOr (ty i) (ineg psi) psi (ilam "o" $ \ _ -> apply_delta_fill i $ t <@> hfill lvl htype phi u u0 i)
+                                                            (ilam "o" $ \ _ -> apply_delta_fill i $ u <@> hfill lvl htype phi u u0 i))
              let recurse []           i = __IMPOSSIBLE__
                  recurse [(psi,u)]    i = u i
                  recurse ((psi,u):xs) i = pOr (ty i) psi (foldr imax (pure iz) (map fst xs)) (u i) (recurse xs i)
              return $ recurse sides
 
-          -- need to use comp and use a fill in the type
-          -- Γ,φ,u,u0 ⊢ comp (\ i. {Δ}[ α1 → b1 ](x = hfill φ u u0 i))
-          --                 (\ i.  [ φ  ↦ d (hfill φ u u0 i)     = d (u i)
-          --                          α0 ↦ b0 (hfill φ u u0 i)
-          --                        ])
-          --                 (d u0)
           ((,) <$> ty (pure io) <*>) $ do
             comp (lam "i" $ \ i -> lift . getLevel =<< ty i)
                (lam "i" $ \ i -> unEl <$> ty i)
-                           (phi `imax` alpha0)
+                           (phi `imax` alpha)
                            (lam "i" $ \ i ->
-                               let rhs = (ilam "o" $ \ o -> call (u <@> i <..> o))
-                               in if null alphab_0 then rhs else
-                                   pOr (ty i) phi alpha0 rhs (b0 i)
+                               let rhs = (ilam "o" $ \ o -> call (u <@> i <..> o) i)
+                               in if null alphab then rhs else
+                                   pOr (ty i) phi alpha rhs (b i)
                            )
-                           (call u0)
-    let n = size tel - (size gamma + 3)
+                           (call u0 (pure iz))
+    reportSDoc "tc.cover.hcomp" 20 $ text "old_tel =" <+> prettyTCM tel
+    let n = size tel - (size gamma + 3 + size delta)
+    reportSDoc "tc.cover.hcomp" 20 $ text "n =" <+> text (show n)
     (TelV deltaEx t,bs) <- telViewUpToPathBoundary' n ty
     rhs <- pure $ raise n rhs `applyE` teleElims deltaEx bs
 
     cxt <- getContextTelescope
     reportSDoc "tc.cover.hcomp" 30 $ text "cxt = " <+> prettyTCM cxt
+    reportSDoc "tc.cover.hcomp" 30 $ text "tel = " <+> prettyTCM tel
+    reportSDoc "tc.cover.hcomp" 20 $ addContext tel $ text "t = " <+> prettyTCM t
     reportSDoc "tc.cover.hcomp" 20 $ addContext tel $ text "rhs = " <+> prettyTCM rhs
 
     return $ Clause { clauseLHSRange  = noRange
@@ -769,8 +902,7 @@ checkIApplyConfluence f (SClause tel ps' _ cps (Just t)) = setCurrentRange f $ d
             let es = patternsToElims ps
             let lhs = Def f es
             body <- fmap ignoreBlocking $ liftReduce $ unfoldDefinitionE False (return . notBlocked) (Def f []) f es
-            locallyTC eRange (const noRange) $
-              equalTermOnFace phi trhs lhs body
+            equalTermOnFace phi trhs lhs body
 checkIApplyConfluence f (SClause tel ps _ cps Nothing) = __IMPOSSIBLE__
 
 
